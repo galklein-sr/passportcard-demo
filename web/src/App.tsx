@@ -12,6 +12,8 @@ type CallResult = {
 };
 type Channel = "voice" | "whatsapp";
 
+const API_BASE = (import.meta.env.VITE_API_BASE_URL ?? "").replace(/\/$/, "");
+
 export default function App() {
   const [contacts, setContacts] = useState<Contact[]>([]);
   const [selected, setSelected] = useState<string | null>(null);
@@ -23,7 +25,7 @@ export default function App() {
   useEffect(() => {
     (async () => {
       try {
-        const r = await fetch("/api/contacts");
+        const r = await fetch(`${API_BASE}/api/contacts`);
         if (!r.ok) throw new Error(`Server returned ${r.status} ${r.statusText}`);
         const text = await r.text();
         if (!text) throw new Error("Empty response from /api/contacts — is the FastAPI server running on :8000?");
@@ -40,7 +42,7 @@ export default function App() {
     setError(null);
     setResult(null);
     try {
-      const res = await fetch("/api/call", {
+      const res = await fetch(`${API_BASE}/api/call`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ contactId: selected, channel }),
@@ -111,7 +113,7 @@ export default function App() {
           {busy && (
             <span>
               <span className="pulse" />
-              {channel === "voice" ? "יוזם שיחה דרך Twilio…" : "שולח הודעה דרך Twilio…"}
+              {channel === "voice" ? "יוזם שיחה דרך Abra…" : "שולח הודעה דרך Abra…"}
             </span>
           )}
         </div>
@@ -155,7 +157,7 @@ export default function App() {
         )}
       </div>
 
-      <div className="footer">© PassportCard demo · OpenAI Realtime + Twilio (Voice & WhatsApp)</div>
+      <div className="footer">© PassportCard demo · Abra Amit (Voice & WhatsApp)</div>
     </div>
   );
 }

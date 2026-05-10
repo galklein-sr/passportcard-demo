@@ -19,9 +19,11 @@ from use_cases import CASES, get_case
 
 app = FastAPI(title="PassportCard Pay – Service Agent Demo")
 
+_web_origin = os.environ.get("WEB_ORIGIN", "").strip()
+_allowed_origins = [o.strip() for o in _web_origin.split(",") if o.strip()] if _web_origin else ["*"]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_allowed_origins,
     allow_methods=["*"],
     allow_headers=["*"],
 )
