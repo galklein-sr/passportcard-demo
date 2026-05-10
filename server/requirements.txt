@@ -1,0 +1,6 @@
+fastapi>=0.115
+uvicorn[standard]>=0.30
+websockets>=13
+twilio>=9.3
+python-dotenv>=1.0
+openpyxl>=3.1
