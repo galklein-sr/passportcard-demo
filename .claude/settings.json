@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git -c 'user.name=Gal Klein' -c user.email=gal.klein@abra-it.com commit -m 'Use Hebrew plural address; open directly about the payment issue *)",
+      "Bash(git add *)",
+      "Bash(git commit -m ' *)"
+    ]
+  }
+}
