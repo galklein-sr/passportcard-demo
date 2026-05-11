@@ -208,11 +208,10 @@ async def _run(twilio_ws: WebSocket, ctx: dict, stream_sid: str):
                 "instructions": instructions,
             },
         }))
-        # Trigger the agent's opening line.
-        await oai_ws.send(json.dumps({
-            "type": "response.create",
-            "response": {"instructions": "פתח את השיחה עכשיו לפי ההנחיות."},
-        }))
+        # Trigger the agent's opening line. No `response.instructions` override —
+        # that field REPLACES the session prompt for the response, which would leave
+        # the cold-open with no system context and produce off-prompt filler.
+        await oai_ws.send(json.dumps({"type": "response.create"}))
 
         async def twilio_to_openai():
             try:
