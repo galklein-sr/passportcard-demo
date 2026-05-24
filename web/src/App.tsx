@@ -9,18 +9,29 @@ type CallResult = {
   contact: Contact;
   case: CaseInfo;
   preview?: string;
+  tts?: TtsProvider;
 };
 type Channel = "voice" | "whatsapp";
+type TtsProvider = "openai" | "soniox";
 
 const API_BASE = (import.meta.env.VITE_API_BASE_URL ?? "").replace(/\/$/, "");
+const TTS_STORAGE_KEY = "pc-demo-tts-provider";
 
 export default function App() {
   const [contacts, setContacts] = useState<Contact[]>([]);
   const [selected, setSelected] = useState<string | null>(null);
   const [channel, setChannel] = useState<Channel>("voice");
+  const [ttsProvider, setTtsProvider] = useState<TtsProvider>(() => {
+    const v = typeof window !== "undefined" ? window.localStorage.getItem(TTS_STORAGE_KEY) : null;
+    return v === "soniox" ? "soniox" : "openai";
+  });
   const [busy, setBusy] = useState(false);
   const [result, setResult] = useState<CallResult | null>(null);
   const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    window.localStorage.setItem(TTS_STORAGE_KEY, ttsProvider);
+  }, [ttsProvider]);
 
   useEffect(() => {
     (async () => {
@@ -45,7 +56,11 @@ export default function App() {
       const res = await fetch(`${API_BASE}/api/call`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ contactId: selected, channel }),
+        body: JSON.stringify({
+          contactId: selected,
+          channel,
+          ...(channel === "voice" ? { ttsProvider } : {}),
+        }),
       });
       if (!res.ok) throw new Error(await res.text());
       setResult(await res.json());
@@ -105,6 +120,28 @@ export default function App() {
           </button>
         </div>
 
+        {channel === "voice" && (
+          <>
+            <h3 className="section-title">ספק TTS</h3>
+            <div className="channel-toggle" role="tablist">
+              <button
+                className={`channel ${ttsProvider === "openai" ? "active" : ""}`}
+                onClick={() => setTtsProvider("openai")}
+                type="button"
+              >
+                OpenAI Realtime
+              </button>
+              <button
+                className={`channel ${ttsProvider === "soniox" ? "active" : ""}`}
+                onClick={() => setTtsProvider("soniox")}
+                type="button"
+              >
+                Soniox
+              </button>
+            </div>
+          </>
+        )}
+
         <div className="cta-row">
           <button className="btn" disabled={!selected || busy} onClick={initiate}>
             <span className="ico">{channel === "voice" ? "📞" : "💬"}</span>
@@ -140,6 +177,12 @@ export default function App() {
               <span>{result.channel === "voice" ? "Call SID:" : "Message SID:"}</span>
               <code>{result.callSid || result.messageSid}</code>
             </div>
+            {result.channel === "voice" && result.tts && (
+              <div className="row" style={{ marginTop: 4 }}>
+                <span>TTS:</span>
+                <code>{result.tts === "soniox" ? "Soniox" : "OpenAI Realtime"}</code>
+              </div>
+            )}
 
             <div className="case-box">
               <div className="label">תרחיש שנבחר אקראית</div>

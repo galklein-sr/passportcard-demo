@@ -15,7 +15,10 @@ from pydantic import BaseModel
 from twilio.rest import Client as TwilioClient
 
 from bridge import openai_realtime_url, openai_headers
+from tts_soniox import SonioxSession
 from use_cases import CASES, get_case
+
+TtsProvider = str  # "openai" | "soniox"
 
 app = FastAPI(title="PassportCard Pay – Service Agent Demo")
 
@@ -54,6 +57,7 @@ def list_cases():
 class CallRequest(BaseModel):
     contactId: str
     channel: str = "voice"  # "voice" | "whatsapp"
+    ttsProvider: str = "openai"  # "openai" | "soniox" (voice only)
 
 
 def _case_summary(case: dict) -> dict:
@@ -97,24 +101,34 @@ def initiate_call(req: CallRequest):
         }
 
     # Voice
+    tts = (req.ttsProvider or "openai").lower()
+    if tts not in ("openai", "soniox"):
+        raise HTTPException(400, f"Unknown ttsProvider '{tts}'")
+    if tts == "soniox" and not os.environ.get("SONIOX_API_KEY"):
+        raise HTTPException(400, "SONIOX_API_KEY not set in .env — cannot use Soniox TTS")
+
     public_base = os.environ["PUBLIC_BASE_URL"].rstrip("/")
-    twiml_url = f"{public_base}/twiml?case={quote(case['id'])}&name={quote(contact['name'])}"
+    twiml_url = (
+        f"{public_base}/twiml?case={quote(case['id'])}"
+        f"&name={quote(contact['name'])}&tts={quote(tts)}"
+    )
     call = twilio().calls.create(
         to=contact["phone"],
         from_=os.environ["TWILIO_FROM_NUMBER"],
         url=twiml_url,
     )
-    CALL_STATE[call.sid] = {"customer_name": contact["name"], "case": case}
+    CALL_STATE[call.sid] = {"customer_name": contact["name"], "case": case, "tts": tts}
     return {
         "channel": "voice",
         "callSid": call.sid,
         "contact": contact,
         "case": _case_summary(case),
+        "tts": tts,
     }
 
 
 @app.api_route("/twiml", methods=["GET", "POST"])
-def twiml(request: Request, case: str, name: str):
+def twiml(request: Request, case: str, name: str, tts: str = "openai"):
     public_base = os.environ["PUBLIC_BASE_URL"].rstrip("/")
     host = urlparse(public_base).netloc
     ws_url = f"wss://{host}/ws"
@@ -124,6 +138,7 @@ def twiml(request: Request, case: str, name: str):
     <Stream url="{ws_url}">
       <Parameter name="case" value="{case}"/>
       <Parameter name="name" value="{name}"/>
+      <Parameter name="tts" value="{tts}"/>
     </Stream>
   </Connect>
 </Response>"""
@@ -151,23 +166,25 @@ async def ws_bridge(twilio_ws: WebSocket):
         customer_name = params.get("name", customer_name)
         case_id = params.get("case", "")
         case = get_case(case_id) or (CASES[0] if CASES else None)
+        tts_param = (params.get("tts") or "openai").lower()
         stream_sid = first["start"]["streamSid"]
         call_sid = first["start"].get("callSid")
         if call_sid and call_sid in CALL_STATE:
             ctx = CALL_STATE[call_sid]
         else:
-            ctx = {"customer_name": customer_name, "case": case}
+            ctx = {"customer_name": customer_name, "case": case, "tts": tts_param}
+        ctx.setdefault("tts", tts_param)
 
-        # Re-inject the start event into a queue-like flow: bridge expects to read media events,
-        # so we pass an already-consumed-start scenario by giving it a wrapped websocket.
-        # Simpler: directly run the bridge but also pass the streamSid via a side channel.
-        await _run(twilio_ws, ctx, stream_sid)
+        if ctx.get("tts") == "soniox":
+            await _run_openai_text_soniox(twilio_ws, ctx, stream_sid)
+        else:
+            await _run_openai_audio(twilio_ws, ctx, stream_sid)
     except WebSocketDisconnect:
         return
 
 
-async def _run(twilio_ws: WebSocket, ctx: dict, stream_sid: str):
-    """Twilio <-> OpenAI Realtime bridge. We've already consumed Twilio's `start` event."""
+async def _run_openai_audio(twilio_ws: WebSocket, ctx: dict, stream_sid: str):
+    """Twilio <-> OpenAI Realtime bridge (audio in, audio out)."""
     import asyncio, json, os
     import websockets
     from prompt import build_instructions
@@ -264,6 +281,165 @@ async def _run(twilio_ws: WebSocket, ctx: dict, stream_sid: str):
                     print("OpenAI realtime error:", ev)
 
         await asyncio.gather(twilio_to_openai(), openai_to_twilio(), return_exceptions=True)
+
+
+async def _run_openai_text_soniox(twilio_ws: WebSocket, ctx: dict, stream_sid: str):
+    """Twilio <-> OpenAI Realtime (text-only) <-> Soniox TTS bridge.
+
+    OpenAI does STT + LLM + server_vad turn-taking and emits text deltas.
+    We pipe those into a per-turn Soniox WebSocket which streams pcm_mulaw @ 8 kHz
+    base64 chunks back; we forward them to Twilio as media frames.
+    """
+    import asyncio, json, os
+    import websockets
+    from prompt import build_instructions
+
+    model = os.environ.get("OPENAI_REALTIME_MODEL", "gpt-realtime-2")
+    instructions = build_instructions(ctx["customer_name"], ctx["case"])
+
+    # Per-turn Soniox state. Only one turn is active at a time.
+    soniox: SonioxSession | None = None
+    soniox_audio_task: asyncio.Task | None = None
+
+    async def cancel_soniox_turn():
+        """Barge-in: tear down the current Soniox session immediately."""
+        nonlocal soniox, soniox_audio_task
+        if soniox is None:
+            return
+        s, t = soniox, soniox_audio_task
+        soniox = None
+        soniox_audio_task = None
+        try:
+            await s.cancel()
+        except Exception:
+            pass
+        if t is not None:
+            t.cancel()
+            try:
+                await t
+            except (asyncio.CancelledError, Exception):
+                pass
+        try:
+            await s.__aexit__(None, None, None)
+        except Exception:
+            pass
+
+    async def forward_soniox_audio(session: SonioxSession):
+        """Pump Soniox audio to Twilio. On natural end (terminated), self-clean."""
+        nonlocal soniox, soniox_audio_task
+        try:
+            async for payload in session.audio():
+                await twilio_ws.send_text(json.dumps({
+                    "event": "media",
+                    "streamSid": stream_sid,
+                    "media": {"payload": payload},
+                }))
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            print("Soniox audio forward error:", e)
+        finally:
+            # If still the active session, mark idle and close.
+            if soniox is session:
+                soniox = None
+                soniox_audio_task = None
+                try:
+                    await session.__aexit__(None, None, None)
+                except Exception:
+                    pass
+
+    async with websockets.connect(
+        openai_realtime_url(),
+        additional_headers=openai_headers(),
+        max_size=None,
+    ) as oai_ws:
+        # Same session shape as the audio path, but output_modalities=["text"] —
+        # OpenAI keeps doing STT + server_vad turn-taking; we render audio via Soniox.
+        await oai_ws.send(json.dumps({
+            "type": "session.update",
+            "session": {
+                "type": "realtime",
+                "model": model,
+                "output_modalities": ["text"],
+                "audio": {
+                    "input": {
+                        "format": {"type": "audio/pcmu"},
+                        "turn_detection": {
+                            "type": "server_vad",
+                            "threshold": 0.5,
+                            "prefix_padding_ms": 300,
+                            "silence_duration_ms": 500,
+                            "create_response": True,
+                        },
+                    },
+                },
+                "instructions": instructions,
+            },
+        }))
+        await oai_ws.send(json.dumps({"type": "response.create"}))
+
+        async def twilio_to_openai():
+            try:
+                while True:
+                    msg = await twilio_ws.receive_text()
+                    data = json.loads(msg)
+                    ev = data.get("event")
+                    if ev == "media":
+                        await oai_ws.send(json.dumps({
+                            "type": "input_audio_buffer.append",
+                            "audio": data["media"]["payload"],
+                        }))
+                    elif ev == "stop":
+                        break
+            except WebSocketDisconnect:
+                pass
+
+        async def openai_to_soniox():
+            nonlocal soniox, soniox_audio_task
+            async for raw in oai_ws:
+                ev = json.loads(raw)
+                t = ev.get("type")
+                if t == "response.created":
+                    # Start a fresh Soniox turn. If one is somehow still open, drop it.
+                    if soniox is not None:
+                        await cancel_soniox_turn()
+                    resp_id = ev.get("response", {}).get("id") or "resp"
+                    s = SonioxSession(resp_id)
+                    await s.__aenter__()
+                    soniox = s
+                    soniox_audio_task = asyncio.create_task(forward_soniox_audio(s))
+                elif t in ("response.output_text.delta", "response.text.delta"):
+                    if soniox is not None:
+                        delta = ev.get("delta", "")
+                        if delta:
+                            try:
+                                await soniox.send_text(delta)
+                            except Exception as e:
+                                print("Soniox send_text error:", e)
+                elif t in ("response.output_text.done", "response.done"):
+                    if soniox is not None:
+                        try:
+                            await soniox.send_text("", end=True)
+                        except Exception as e:
+                            print("Soniox text_end error:", e)
+                elif t == "input_audio_buffer.speech_started":
+                    # Barge-in: cancel OpenAI response, cancel Soniox turn, clear Twilio buffer.
+                    try:
+                        await oai_ws.send(json.dumps({"type": "response.cancel"}))
+                    except Exception:
+                        pass
+                    await cancel_soniox_turn()
+                    await twilio_ws.send_text(json.dumps({
+                        "event": "clear",
+                        "streamSid": stream_sid,
+                    }))
+                elif t == "error":
+                    print("OpenAI realtime error:", ev)
+
+        try:
+            await asyncio.gather(twilio_to_openai(), openai_to_soniox(), return_exceptions=True)
+        finally:
+            await cancel_soniox_turn()
 
 
 if __name__ == "__main__":

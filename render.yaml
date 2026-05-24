@@ -28,3 +28,11 @@ services:
         sync: false
       - key: WEB_ORIGIN
         sync: false
+      - key: SONIOX_API_KEY
+        sync: false
+      - key: SONIOX_MODEL
+        value: tts-rt-v1
+      - key: SONIOX_VOICE
+        value: Maya
+      - key: SONIOX_LANGUAGE
+        value: he
