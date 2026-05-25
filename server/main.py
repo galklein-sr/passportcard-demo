@@ -286,62 +286,58 @@ async def _run_openai_audio(twilio_ws: WebSocket, ctx: dict, stream_sid: str):
 async def _run_openai_text_soniox(twilio_ws: WebSocket, ctx: dict, stream_sid: str):
     """Twilio <-> OpenAI Realtime (text-only) <-> Soniox TTS bridge.
 
-    OpenAI does STT + LLM + server_vad turn-taking and emits text deltas.
-    We pipe those into a per-turn Soniox WebSocket which streams pcm_mulaw @ 8 kHz
-    base64 chunks back; we forward them to Twilio as media frames.
+    Conversational design:
+      - OpenAI emits text deltas; we buffer them until a sentence boundary.
+      - Each sentence is rendered as its own short Soniox stream (cheap, since
+        the WebSocket is shared and persistent).
+      - We trail each sentence's audio with a Twilio `mark` so we know exactly
+        when playback finishes on the customer's line. Between marks we open
+        the customer-audio gate briefly so OpenAI's VAD can detect a real
+        barge-in — without echo leaking back during agent speech.
+      - On barge-in (VAD speech_started while the gate is open), we cancel the
+        in-flight OpenAI response and drop any queued sentences for that turn.
     """
-    import asyncio, json, os
+    import asyncio, base64, json, os, re
+    import time as _time
     import websockets
     from prompt import build_instructions
 
-    voice = os.environ.get("OPENAI_REALTIME_VOICE", "marin")
     model = os.environ.get("OPENAI_REALTIME_MODEL", "gpt-realtime-2")
     instructions = build_instructions(ctx["customer_name"], ctx["case"])
 
-    # Per-call Soniox state. A single SonioxConnection hosts every assistant
-    # turn (Soniox supports up to 5 concurrent streams on one WS and runs
-    # a keepalive heartbeat). Each turn is a SonioxStream.
+    # ---- timing constants ----
+    AGENT_TAIL_GRACE_SEC = 0.10  # tiny tail after Twilio confirms a sentence finished playing
+    BARGE_IN_WINDOW_SEC = 0.60   # gate open between sentences so VAD can fire on real speech
+    FRAME = 160  # bytes = 20 ms of pcm_mulaw at 8 kHz
+
+    # Sentence boundary: any of . ! ? ׃ (Hebrew sof pasuq) followed by space/end,
+    # or a newline. We keep the punctuation in the chunk so Soniox prosody is right.
+    SENTENCE_BOUNDARY = re.compile(r"[.!?׃](?=\s|$)|\n")
+
+    # ---- per-call state ----
+    soniox_conn: SonioxConnection  # set inside the async-with
     current_stream: SonioxStream | None = None
     current_audio_task: asyncio.Task | None = None
-    # Last OpenAI assistant item — needed to truncate on barge-in.
-    last_assistant_item: str | None = None
-    # While the agent is talking, our Soniox audio echoes back through Twilio
-    # into OpenAI's audio input. OpenAI's VAD fires on it and (because we set
-    # create_response:true) auto-creates a new response based on the echo.
-    # We gate customer audio out of OpenAI while Soniox is actively playing,
-    # plus a short post-silence grace, so VAD only sees real customer speech.
-    import time as _time
-    AGENT_TAIL_GRACE_SEC = 0.4
-    # Single timestamp that says "don't forward customer audio until this monotonic time."
-    # Set far in the future while a Soniox stream is active; set to now+grace when it ends.
+    # Single timestamp: drop customer media until monotonic() >= this value.
+    # Far in the future while the agent is mid-sentence; resets to now+grace
+    # when each sentence's audio is confirmed played by Twilio.
     gate_customer_until: float = 0.0
+    # Queue of sentence-text fragments awaiting playback for the current response.
+    sentence_queue: "asyncio.Queue[str | None]" = asyncio.Queue()
+    # Set when the customer barges in (VAD during open gate). Player drops pending sentences.
+    barge_in_event = asyncio.Event()
+    # Maps Twilio mark name -> asyncio.Event we set when that mark echoes back.
+    pending_marks: dict[str, asyncio.Event] = {}
+    # Monotonically-increasing sentence id so each Soniox stream / mark name is unique.
+    sentence_counter = 0
 
-    async def cancel_current_stream():
-        """Barge-in: cancel the current per-turn stream; WS stays open."""
-        nonlocal current_stream, current_audio_task
-        if current_stream is None:
-            return
-        s, t = current_stream, current_audio_task
-        current_stream = None
-        current_audio_task = None
-        try:
-            await s.cancel()
-        except Exception:
-            pass
-        if t is not None:
-            t.cancel()
-            try:
-                await t
-            except (asyncio.CancelledError, Exception):
-                pass
+    def _next_sid(resp_id: str) -> str:
+        nonlocal sentence_counter
+        sentence_counter += 1
+        return f"{resp_id}_s{sentence_counter}"
 
-    async def forward_stream_audio(stream: SonioxStream):
-        """Pump Soniox audio to Twilio in 20 ms frames (Twilio Media Streams
-        expects ~160-byte µ-law @ 8 kHz; larger frames misbehave on some
-        carriers, so we re-frame here)."""
-        import base64
-        nonlocal current_stream, current_audio_task, gate_customer_until
-        FRAME = 160  # bytes = 20 ms of pcm_mulaw at 8 kHz
+    async def forward_stream_audio(stream: SonioxStream) -> None:
+        """Pump Soniox audio chunks to Twilio in 20 ms frames."""
         frames_sent = 0
         try:
             async for payload in stream.audio():
@@ -359,23 +355,108 @@ async def _run_openai_text_soniox(twilio_ws: WebSocket, ctx: dict, stream_sid: s
         except Exception as e:
             print("[soniox] forward error:", e)
         finally:
-            print(f"[soniox] {stream.stream_id} forwarded {frames_sent} frames ({frames_sent*20}ms)")
-            # Keep gating customer audio for a brief tail so the echo of the
-            # last frames doesn't leak into OpenAI's VAD.
-            gate_customer_until = _time.monotonic() + AGENT_TAIL_GRACE_SEC
-            if current_stream is stream:
-                current_stream = None
-                current_audio_task = None
+            print(f"[soniox] {stream.stream_id} forwarded {frames_sent} frames")
 
-    async with SonioxConnection() as soniox_conn, websockets.connect(
+    async def play_sentence(text: str) -> None:
+        """Play one sentence, blocking until Twilio confirms it has finished playing."""
+        nonlocal current_stream, current_audio_task, gate_customer_until
+        text = text.strip()
+        if not text:
+            return
+        # Hard-close the customer audio gate for the duration of this sentence
+        # (60 s ceiling; reset below once Twilio confirms playback finished).
+        gate_customer_until = _time.monotonic() + 60.0
+        sid = _next_sid(text[:8])  # reuse text prefix as a debug hint; we override below
+        # Start a fresh per-sentence Soniox stream.
+        stream = await soniox_conn.start_stream(sid)
+        current_stream = stream
+        audio_task = asyncio.create_task(forward_stream_audio(stream))
+        current_audio_task = audio_task
+        # Send text + text_end so Soniox starts generating and flushes promptly.
+        try:
+            await stream.send_text(text, end=True)
+        except Exception as e:
+            print("[soniox] send_text error:", e)
+        # Wait for all audio chunks to be forwarded to Twilio.
+        try:
+            await audio_task
+        except (asyncio.CancelledError, Exception):
+            pass
+        if current_stream is stream:
+            current_stream = None
+            current_audio_task = None
+        if barge_in_event.is_set():
+            # Audio was cancelled mid-sentence by a barge-in. No point sending
+            # a mark and waiting for it — the buffer is being cleared anyway.
+            return
+        # Send a Twilio mark right after the last audio frame and wait for the
+        # echo so we know the customer actually finished hearing the sentence.
+        mark_name = f"m_{sid}"
+        mark_evt = asyncio.Event()
+        pending_marks[mark_name] = mark_evt
+        try:
+            await twilio_ws.send_text(json.dumps({
+                "event": "mark",
+                "streamSid": stream_sid,
+                "mark": {"name": mark_name},
+            }))
+        except Exception:
+            pending_marks.pop(mark_name, None)
+            return
+        try:
+            await asyncio.wait_for(mark_evt.wait(), timeout=30.0)
+        except asyncio.TimeoutError:
+            print(f"[twilio] mark {mark_name} timed out")
+        finally:
+            pending_marks.pop(mark_name, None)
+        # Tiny echo grace, then open the gate for the barge-in window.
+        gate_customer_until = _time.monotonic() + AGENT_TAIL_GRACE_SEC
+
+    async def cancel_current_sentence() -> None:
+        """Cancel the in-flight Soniox stream (used on barge-in)."""
+        nonlocal current_stream, current_audio_task
+        if current_stream is None:
+            return
+        s, t = current_stream, current_audio_task
+        current_stream = None
+        current_audio_task = None
+        try:
+            await s.cancel()
+        except Exception:
+            pass
+        if t is not None:
+            t.cancel()
+            try:
+                await t
+            except (asyncio.CancelledError, Exception):
+                pass
+
+    async def sentence_player() -> None:
+        """Pull sentences off the queue and play them in order, honoring barge-in."""
+        nonlocal gate_customer_until
+        while True:
+            sentence = await sentence_queue.get()
+            if sentence is None:
+                # End-of-response sentinel: open the gate so customer can talk.
+                gate_customer_until = _time.monotonic() + AGENT_TAIL_GRACE_SEC
+                continue
+            if barge_in_event.is_set():
+                # Drop sentences from a cancelled response.
+                continue
+            await play_sentence(sentence)
+            if barge_in_event.is_set():
+                continue
+            # Brief barge-in window between sentences. Twilio's audio buffer is
+            # now empty (mark confirmed) so VAD won't see echo; only real
+            # customer speech reaches OpenAI during this window.
+            await asyncio.sleep(BARGE_IN_WINDOW_SEC)
+
+    async with SonioxConnection() as _soniox_conn, websockets.connect(
         openai_realtime_url(),
         additional_headers=openai_headers(),
         max_size=None,
     ) as oai_ws:
-        # Text-only. Dual modality ("audio","text") was tried but reliably
-        # breaks output (no audio at all in production). Until we can figure
-        # out what GA Realtime is rejecting, keep this safe and use the prompt
-        # to drive short sentences + acknowledgments for conversational feel.
+        soniox_conn = _soniox_conn  # bind for inner closures (Python doesn't let us nonlocal an outer name from async-with)
         session_msg = {
             "type": "session.update",
             "session": {
@@ -388,8 +469,8 @@ async def _run_openai_text_soniox(twilio_ws: WebSocket, ctx: dict, stream_sid: s
                         "turn_detection": {
                             "type": "server_vad",
                             "threshold": 0.5,
-                            "prefix_padding_ms": 300,
-                            "silence_duration_ms": 500,
+                            "prefix_padding_ms": 200,
+                            "silence_duration_ms": 400,
                             "create_response": True,
                             "interrupt_response": False,
                         },
@@ -409,91 +490,120 @@ async def _run_openai_text_soniox(twilio_ws: WebSocket, ctx: dict, stream_sid: s
                     data = json.loads(msg)
                     ev = data.get("event")
                     if ev == "media":
-                        # Drop customer audio while the agent is talking so the
-                        # agent's own Soniox audio echoing back doesn't trigger
-                        # VAD and spawn ghost responses.
                         if _time.monotonic() < gate_customer_until:
                             continue
                         await oai_ws.send(json.dumps({
                             "type": "input_audio_buffer.append",
                             "audio": data["media"]["payload"],
                         }))
+                    elif ev == "mark":
+                        name = data.get("mark", {}).get("name")
+                        evt = pending_marks.get(name) if name else None
+                        if evt is not None:
+                            evt.set()
                     elif ev == "stop":
                         break
             except WebSocketDisconnect:
                 pass
 
         async def openai_to_soniox():
-            nonlocal current_stream, current_audio_task, last_assistant_item, gate_customer_until
-            delta_count = 0
-            # Events we don't act on but want to see in logs while debugging.
+            """Read OpenAI events, buffer text deltas into sentences, and push
+            sentence text to the player queue. Handle barge-in on VAD start."""
+            nonlocal gate_customer_until
             VERBOSE_EVENTS = {
                 "session.created", "session.updated", "response.created",
-                "response.done", "response.output_item.added",
-                "response.output_text.delta", "response.output_text.done",
-                "response.audio_transcript.delta", "response.audio_transcript.done",
-                "input_audio_buffer.speech_started", "input_audio_buffer.speech_stopped",
-                "conversation.item.created", "rate_limits.updated", "error",
+                "response.done", "input_audio_buffer.speech_started",
+                "input_audio_buffer.speech_stopped", "error",
             }
+            text_buffer = ""
+            delta_count = 0
+            response_id: str | None = None
+
+            def flush_complete_sentences() -> None:
+                nonlocal text_buffer
+                while True:
+                    m = SENTENCE_BOUNDARY.search(text_buffer)
+                    if m is None:
+                        return
+                    end = m.end()
+                    chunk = text_buffer[:end].strip()
+                    text_buffer = text_buffer[end:]
+                    if chunk:
+                        sentence_queue.put_nowait(chunk)
+
             async for raw in oai_ws:
                 ev = json.loads(raw)
                 t = ev.get("type")
                 if t in VERBOSE_EVENTS:
                     if t == "error":
                         print(f"[oai] ERROR: {ev}")
-                    elif t in ("response.output_text.delta", "response.text.delta"):
-                        pass  # logged separately as a count
                     else:
                         print(f"[oai] {t}")
 
                 if t == "response.created":
-                    if current_stream is not None:
-                        print("[oai] response.created while prior Soniox stream still active — cancelling")
-                        await cancel_current_stream()
-                    resp_id = ev.get("response", {}).get("id") or "resp"
-                    print(f"[oai] response.created id={resp_id}")
-                    # Block customer audio from reaching OpenAI for the entire
-                    # turn; the forward task will reset the gate to now+grace
-                    # when the stream ends.
-                    gate_customer_until = _time.monotonic() + 60.0  # "still speaking"
-                    # Also clear whatever VAD may have buffered before this turn —
-                    # mostly defensive against any echo that leaked in earlier.
+                    barge_in_event.clear()
+                    text_buffer = ""
+                    delta_count = 0
+                    response_id = ev.get("response", {}).get("id") or "resp"
+                    print(f"[oai] response.created id={response_id}")
+                    # Hard-close gate for the upcoming sentence(s).
+                    gate_customer_until = _time.monotonic() + 60.0
                     try:
                         await oai_ws.send(json.dumps({"type": "input_audio_buffer.clear"}))
                     except Exception:
                         pass
-                    stream = await soniox_conn.start_stream(resp_id)
-                    current_stream = stream
-                    current_audio_task = asyncio.create_task(forward_stream_audio(stream))
-                    delta_count = 0
                 elif t in ("response.output_text.delta", "response.text.delta"):
-                    if current_stream is not None:
-                        delta = ev.get("delta", "")
-                        if delta:
-                            delta_count += 1
-                            try:
-                                await current_stream.send_text(delta)
-                            except Exception as e:
-                                print("[soniox] send_text error:", e)
+                    if barge_in_event.is_set():
+                        continue
+                    delta = ev.get("delta", "")
+                    if not delta:
+                        continue
+                    delta_count += 1
+                    text_buffer += delta
+                    flush_complete_sentences()
                 elif t == "response.done":
-                    if current_stream is not None:
-                        print(f"[oai] response.done after {delta_count} text deltas — flushing text_end")
-                        try:
-                            await current_stream.send_text("", end=True)
-                        except Exception as e:
-                            print("[soniox] text_end error:", e)
-                    last_assistant_item = None
+                    # Flush any trailing text without a final punctuation.
+                    if text_buffer.strip() and not barge_in_event.is_set():
+                        sentence_queue.put_nowait(text_buffer.strip())
+                    text_buffer = ""
+                    sentence_queue.put_nowait(None)  # end-of-response sentinel
+                    print(f"[oai] response.done after {delta_count} text deltas")
                 elif t == "input_audio_buffer.speech_started":
-                    # interrupt_response=False — OpenAI buffers the customer's
-                    # speech and creates a new response when they're done. No
-                    # mid-utterance barge-in in this mode, but the conversation
-                    # still pivots on speech end.
-                    pass
+                    # Only treat as barge-in if our gate is currently OPEN
+                    # (i.e., between sentences). If the gate is closed the
+                    # event is almost certainly echo and we ignore it.
+                    if _time.monotonic() >= gate_customer_until:
+                        print("[oai] customer barge-in detected")
+                        barge_in_event.set()
+                        # Drain the sentence queue so the player drops the rest.
+                        while not sentence_queue.empty():
+                            try:
+                                sentence_queue.get_nowait()
+                            except asyncio.QueueEmpty:
+                                break
+                        try:
+                            await oai_ws.send(json.dumps({"type": "response.cancel"}))
+                        except Exception:
+                            pass
+                        await cancel_current_sentence()
+                        # Flush whatever Twilio still has buffered.
+                        try:
+                            await twilio_ws.send_text(json.dumps({
+                                "event": "clear",
+                                "streamSid": stream_sid,
+                            }))
+                        except Exception:
+                            pass
 
         try:
-            await asyncio.gather(twilio_to_openai(), openai_to_soniox(), return_exceptions=True)
+            await asyncio.gather(
+                twilio_to_openai(),
+                openai_to_soniox(),
+                sentence_player(),
+                return_exceptions=True,
+            )
         finally:
-            await cancel_current_stream()
+            await cancel_current_sentence()
 
 
 if __name__ == "__main__":
