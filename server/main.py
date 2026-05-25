@@ -294,12 +294,15 @@ async def _run_openai_text_soniox(twilio_ws: WebSocket, ctx: dict, stream_sid: s
     import websockets
     from prompt import build_instructions
 
+    voice = os.environ.get("OPENAI_REALTIME_VOICE", "marin")
     model = os.environ.get("OPENAI_REALTIME_MODEL", "gpt-realtime-2")
     instructions = build_instructions(ctx["customer_name"], ctx["case"])
 
     # Per-turn Soniox state. Only one turn is active at a time.
     soniox: SonioxSession | None = None
     soniox_audio_task: asyncio.Task | None = None
+    # Last OpenAI assistant item — needed to truncate on barge-in.
+    last_assistant_item: str | None = None
 
     async def cancel_soniox_turn():
         """Barge-in: tear down the current Soniox session immediately."""
@@ -366,28 +369,33 @@ async def _run_openai_text_soniox(twilio_ws: WebSocket, ctx: dict, stream_sid: s
         additional_headers=openai_headers(),
         max_size=None,
     ) as oai_ws:
-        # Same session shape as the audio path, but output_modalities=["text"] —
-        # OpenAI keeps doing STT + server_vad turn-taking; we render audio via Soniox.
-        # interrupt_response=False: OpenAI doesn't see the Soniox audio playing to
-        # the customer, so any echo bleeding back into the call would otherwise be
-        # treated as customer speech and barge-in over the agent's first sentence.
+        # Hybrid: OpenAI produces both audio AND text. We discard the audio and
+        # feed the text to Soniox for the customer-facing voice. The audio output
+        # is kept solely so OpenAI's server-side state knows when *it* is speaking
+        # — without it, the agent's own Soniox audio echoing back would trigger
+        # VAD barge-in. With audio modeled internally, interrupt_response can stay
+        # on and customer barge-in works naturally.
         await oai_ws.send(json.dumps({
             "type": "session.update",
             "session": {
                 "type": "realtime",
                 "model": model,
-                "output_modalities": ["text"],
+                "output_modalities": ["audio", "text"],
                 "audio": {
                     "input": {
                         "format": {"type": "audio/pcmu"},
                         "turn_detection": {
                             "type": "server_vad",
-                            "threshold": 0.6,
+                            "threshold": 0.5,
                             "prefix_padding_ms": 300,
-                            "silence_duration_ms": 600,
+                            "silence_duration_ms": 500,
                             "create_response": True,
-                            "interrupt_response": False,
+                            "interrupt_response": True,
                         },
+                    },
+                    "output": {
+                        "format": {"type": "audio/pcmu"},
+                        "voice": voice,
                     },
                 },
                 "instructions": instructions,
@@ -412,7 +420,7 @@ async def _run_openai_text_soniox(twilio_ws: WebSocket, ctx: dict, stream_sid: s
                 pass
 
         async def openai_to_soniox():
-            nonlocal soniox, soniox_audio_task
+            nonlocal soniox, soniox_audio_task, last_assistant_item
             delta_count = 0
             async for raw in oai_ws:
                 ev = json.loads(raw)
@@ -438,6 +446,11 @@ async def _run_openai_text_soniox(twilio_ws: WebSocket, ctx: dict, stream_sid: s
                                 await soniox.send_text(delta)
                             except Exception as e:
                                 print("[soniox] send_text error:", e)
+                elif t in ("response.output_audio.delta", "response.audio.delta"):
+                    # OpenAI audio is generated solely to keep server-side VAD honest;
+                    # we don't forward it. Just track the item id so we can truncate
+                    # this assistant turn cleanly when the customer barges in.
+                    last_assistant_item = ev.get("item_id", last_assistant_item)
                 elif t == "response.done":
                     # End-of-response is the only signal we use to flush text_end.
                     # `response.output_text.done` also fires but earlier double-flushing
@@ -448,11 +461,29 @@ async def _run_openai_text_soniox(twilio_ws: WebSocket, ctx: dict, stream_sid: s
                             await soniox.send_text("", end=True)
                         except Exception as e:
                             print("[soniox] text_end error:", e)
+                    last_assistant_item = None
                 elif t == "input_audio_buffer.speech_started":
-                    # interrupt_response=False on the session means OpenAI buffers the
-                    # incoming speech but won't cancel the in-flight response. Echo or
-                    # background noise will no longer cut off Soniox mid-utterance.
-                    print("[oai] speech_started (buffered, no barge-in in soniox mode)")
+                    # OpenAI has audio context now, so this is real customer speech,
+                    # not an echo of our Soniox output. Barge-in: cancel OpenAI's
+                    # response, truncate the assistant item, kill Soniox, clear Twilio.
+                    print("[oai] speech_started — barge-in")
+                    if last_assistant_item:
+                        try:
+                            await oai_ws.send(json.dumps({"type": "response.cancel"}))
+                            await oai_ws.send(json.dumps({
+                                "type": "conversation.item.truncate",
+                                "item_id": last_assistant_item,
+                                "content_index": 0,
+                                "audio_end_ms": 0,
+                            }))
+                        except Exception:
+                            pass
+                        last_assistant_item = None
+                    await cancel_soniox_turn()
+                    await twilio_ws.send_text(json.dumps({
+                        "event": "clear",
+                        "streamSid": stream_sid,
+                    }))
                 elif t == "error":
                     print("[oai] error:", ev)
 
