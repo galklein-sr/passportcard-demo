@@ -359,16 +359,18 @@ async def _run_openai_text_soniox(twilio_ws: WebSocket, ctx: dict, stream_sid: s
         additional_headers=openai_headers(),
         max_size=None,
     ) as oai_ws:
-        # OpenAI produces text only; Soniox renders the customer-facing voice.
-        # To get interruption back, we gate the customer-audio path into OpenAI
-        # so that VAD never sees the period when Soniox is actively speaking
-        # (echo of our own voice was triggering it). See twilio_to_openai below.
+        # Hybrid: OpenAI produces both audio AND text. We discard the audio and
+        # feed the text to Soniox for the customer-facing voice. The audio output
+        # is kept solely so OpenAI's server-side state knows when *it* is speaking
+        # — without it, the agent's own Soniox audio echoing back into the call
+        # would trigger VAD barge-in. With audio modeled internally, we can keep
+        # interrupt_response on and barge-in works on real customer speech only.
         session_msg = {
             "type": "session.update",
             "session": {
                 "type": "realtime",
                 "model": model,
-                "output_modalities": ["text"],
+                "output_modalities": ["audio", "text"],
                 "audio": {
                     "input": {
                         "format": {"type": "audio/pcmu"},
@@ -378,8 +380,12 @@ async def _run_openai_text_soniox(twilio_ws: WebSocket, ctx: dict, stream_sid: s
                             "prefix_padding_ms": 300,
                             "silence_duration_ms": 500,
                             "create_response": True,
-                            "interrupt_response": False,
+                            "interrupt_response": True,
                         },
+                    },
+                    "output": {
+                        "format": {"type": "audio/pcmu"},
+                        "voice": voice,
                     },
                 },
                 "instructions": instructions,
@@ -447,6 +453,11 @@ async def _run_openai_text_soniox(twilio_ws: WebSocket, ctx: dict, stream_sid: s
                                 await current_stream.send_text(delta)
                             except Exception as e:
                                 print("[soniox] send_text error:", e)
+                elif t in ("response.output_audio.delta", "response.audio.delta"):
+                    # We don't forward OpenAI audio to Twilio (Soniox renders the
+                    # voice), but we need item_id from these events to truncate
+                    # the assistant turn on barge-in.
+                    last_assistant_item = ev.get("item_id", last_assistant_item)
                 elif t == "response.done":
                     if current_stream is not None:
                         print(f"[oai] response.done after {delta_count} text deltas — flushing text_end")
@@ -456,10 +467,29 @@ async def _run_openai_text_soniox(twilio_ws: WebSocket, ctx: dict, stream_sid: s
                             print("[soniox] text_end error:", e)
                     last_assistant_item = None
                 elif t == "input_audio_buffer.speech_started":
-                    # interrupt_response=False on the session means OpenAI buffers
-                    # the speech and creates a new response when the customer is done.
-                    # No barge-in: Soniox keeps playing the agent's current sentence.
-                    pass
+                    # OpenAI generates audio internally, so its VAD knows when *it*
+                    # is speaking — this event represents real customer speech, not
+                    # echo of the Soniox audio. Cancel the OpenAI response, truncate
+                    # the assistant item, cancel the current Soniox stream, and
+                    # clear Twilio's outbound buffer so playback stops immediately.
+                    print("[oai] speech_started — barge-in")
+                    if last_assistant_item:
+                        try:
+                            await oai_ws.send(json.dumps({"type": "response.cancel"}))
+                            await oai_ws.send(json.dumps({
+                                "type": "conversation.item.truncate",
+                                "item_id": last_assistant_item,
+                                "content_index": 0,
+                                "audio_end_ms": 0,
+                            }))
+                        except Exception:
+                            pass
+                        last_assistant_item = None
+                    await cancel_current_stream()
+                    await twilio_ws.send_text(json.dumps({
+                        "event": "clear",
+                        "streamSid": stream_sid,
+                    }))
 
         try:
             await asyncio.gather(twilio_to_openai(), openai_to_soniox(), return_exceptions=True)
