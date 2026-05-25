@@ -305,6 +305,16 @@ async def _run_openai_text_soniox(twilio_ws: WebSocket, ctx: dict, stream_sid: s
     current_audio_task: asyncio.Task | None = None
     # Last OpenAI assistant item — needed to truncate on barge-in.
     last_assistant_item: str | None = None
+    # While the agent is talking, our Soniox audio echoes back through Twilio
+    # into OpenAI's audio input. OpenAI's VAD fires on it and (because we set
+    # create_response:true) auto-creates a new response based on the echo.
+    # We gate customer audio out of OpenAI while Soniox is actively playing,
+    # plus a short post-silence grace, so VAD only sees real customer speech.
+    import time as _time
+    AGENT_TAIL_GRACE_SEC = 0.4
+    # Single timestamp that says "don't forward customer audio until this monotonic time."
+    # Set far in the future while a Soniox stream is active; set to now+grace when it ends.
+    gate_customer_until: float = 0.0
 
     async def cancel_current_stream():
         """Barge-in: cancel the current per-turn stream; WS stays open."""
@@ -330,7 +340,7 @@ async def _run_openai_text_soniox(twilio_ws: WebSocket, ctx: dict, stream_sid: s
         expects ~160-byte µ-law @ 8 kHz; larger frames misbehave on some
         carriers, so we re-frame here)."""
         import base64
-        nonlocal current_stream, current_audio_task
+        nonlocal current_stream, current_audio_task, gate_customer_until
         FRAME = 160  # bytes = 20 ms of pcm_mulaw at 8 kHz
         frames_sent = 0
         try:
@@ -350,6 +360,9 @@ async def _run_openai_text_soniox(twilio_ws: WebSocket, ctx: dict, stream_sid: s
             print("[soniox] forward error:", e)
         finally:
             print(f"[soniox] {stream.stream_id} forwarded {frames_sent} frames ({frames_sent*20}ms)")
+            # Keep gating customer audio for a brief tail so the echo of the
+            # last frames doesn't leak into OpenAI's VAD.
+            gate_customer_until = _time.monotonic() + AGENT_TAIL_GRACE_SEC
             if current_stream is stream:
                 current_stream = None
                 current_audio_task = None
@@ -396,6 +409,11 @@ async def _run_openai_text_soniox(twilio_ws: WebSocket, ctx: dict, stream_sid: s
                     data = json.loads(msg)
                     ev = data.get("event")
                     if ev == "media":
+                        # Drop customer audio while the agent is talking so the
+                        # agent's own Soniox audio echoing back doesn't trigger
+                        # VAD and spawn ghost responses.
+                        if _time.monotonic() < gate_customer_until:
+                            continue
                         await oai_ws.send(json.dumps({
                             "type": "input_audio_buffer.append",
                             "audio": data["media"]["payload"],
@@ -406,7 +424,7 @@ async def _run_openai_text_soniox(twilio_ws: WebSocket, ctx: dict, stream_sid: s
                 pass
 
         async def openai_to_soniox():
-            nonlocal current_stream, current_audio_task, last_assistant_item
+            nonlocal current_stream, current_audio_task, last_assistant_item, gate_customer_until
             delta_count = 0
             # Events we don't act on but want to see in logs while debugging.
             VERBOSE_EVENTS = {
@@ -434,6 +452,16 @@ async def _run_openai_text_soniox(twilio_ws: WebSocket, ctx: dict, stream_sid: s
                         await cancel_current_stream()
                     resp_id = ev.get("response", {}).get("id") or "resp"
                     print(f"[oai] response.created id={resp_id}")
+                    # Block customer audio from reaching OpenAI for the entire
+                    # turn; the forward task will reset the gate to now+grace
+                    # when the stream ends.
+                    gate_customer_until = _time.monotonic() + 60.0  # "still speaking"
+                    # Also clear whatever VAD may have buffered before this turn —
+                    # mostly defensive against any echo that leaked in earlier.
+                    try:
+                        await oai_ws.send(json.dumps({"type": "input_audio_buffer.clear"}))
+                    except Exception:
+                        pass
                     stream = await soniox_conn.start_stream(resp_id)
                     current_stream = stream
                     current_audio_task = asyncio.create_task(forward_stream_audio(stream))
