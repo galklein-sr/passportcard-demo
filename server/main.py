@@ -15,7 +15,7 @@ from pydantic import BaseModel
 from twilio.rest import Client as TwilioClient
 
 from bridge import openai_realtime_url, openai_headers
-from tts_soniox import SonioxSession
+from tts_soniox import SonioxConnection, SonioxStream
 from use_cases import CASES, get_case
 
 TtsProvider = str  # "openai" | "soniox"
@@ -298,20 +298,22 @@ async def _run_openai_text_soniox(twilio_ws: WebSocket, ctx: dict, stream_sid: s
     model = os.environ.get("OPENAI_REALTIME_MODEL", "gpt-realtime-2")
     instructions = build_instructions(ctx["customer_name"], ctx["case"])
 
-    # Per-turn Soniox state. Only one turn is active at a time.
-    soniox: SonioxSession | None = None
-    soniox_audio_task: asyncio.Task | None = None
+    # Per-call Soniox state. A single SonioxConnection hosts every assistant
+    # turn (Soniox supports up to 5 concurrent streams on one WS and runs
+    # a keepalive heartbeat). Each turn is a SonioxStream.
+    current_stream: SonioxStream | None = None
+    current_audio_task: asyncio.Task | None = None
     # Last OpenAI assistant item — needed to truncate on barge-in.
     last_assistant_item: str | None = None
 
-    async def cancel_soniox_turn():
-        """Barge-in: tear down the current Soniox session immediately."""
-        nonlocal soniox, soniox_audio_task
-        if soniox is None:
+    async def cancel_current_stream():
+        """Barge-in: cancel the current per-turn stream; WS stays open."""
+        nonlocal current_stream, current_audio_task
+        if current_stream is None:
             return
-        s, t = soniox, soniox_audio_task
-        soniox = None
-        soniox_audio_task = None
+        s, t = current_stream, current_audio_task
+        current_stream = None
+        current_audio_task = None
         try:
             await s.cancel()
         except Exception:
@@ -322,24 +324,17 @@ async def _run_openai_text_soniox(twilio_ws: WebSocket, ctx: dict, stream_sid: s
                 await t
             except (asyncio.CancelledError, Exception):
                 pass
-        try:
-            await s.__aexit__(None, None, None)
-        except Exception:
-            pass
 
-    async def forward_soniox_audio(session: SonioxSession):
-        """Pump Soniox audio to Twilio. On natural end (terminated), self-clean.
-
-        Soniox can emit large pcm_mulaw chunks (hundreds of ms). Twilio Media
-        Streams expects ~20 ms frames (160 bytes µ-law @ 8 kHz). Larger frames
-        play unevenly or get truncated on some carriers, so we re-frame here.
-        """
+    async def forward_stream_audio(stream: SonioxStream):
+        """Pump Soniox audio to Twilio in 20 ms frames (Twilio Media Streams
+        expects ~160-byte µ-law @ 8 kHz; larger frames misbehave on some
+        carriers, so we re-frame here)."""
         import base64
-        nonlocal soniox, soniox_audio_task
+        nonlocal current_stream, current_audio_task
         FRAME = 160  # bytes = 20 ms of pcm_mulaw at 8 kHz
         frames_sent = 0
         try:
-            async for payload in session.audio():
+            async for payload in stream.audio():
                 raw = base64.b64decode(payload)
                 for off in range(0, len(raw), FRAME):
                     chunk = raw[off:off + FRAME]
@@ -354,17 +349,12 @@ async def _run_openai_text_soniox(twilio_ws: WebSocket, ctx: dict, stream_sid: s
         except Exception as e:
             print("[soniox] forward error:", e)
         finally:
-            print(f"[soniox] {session.stream_id} forwarded {frames_sent} frames ({frames_sent*20}ms)")
-            # If still the active session, mark idle and close.
-            if soniox is session:
-                soniox = None
-                soniox_audio_task = None
-                try:
-                    await session.__aexit__(None, None, None)
-                except Exception:
-                    pass
+            print(f"[soniox] {stream.stream_id} forwarded {frames_sent} frames ({frames_sent*20}ms)")
+            if current_stream is stream:
+                current_stream = None
+                current_audio_task = None
 
-    async with websockets.connect(
+    async with SonioxConnection() as soniox_conn, websockets.connect(
         openai_realtime_url(),
         additional_headers=openai_headers(),
         max_size=None,
@@ -416,7 +406,7 @@ async def _run_openai_text_soniox(twilio_ws: WebSocket, ctx: dict, stream_sid: s
                 pass
 
         async def openai_to_soniox():
-            nonlocal soniox, soniox_audio_task, last_assistant_item
+            nonlocal current_stream, current_audio_task, last_assistant_item
             delta_count = 0
             # Events we don't act on but want to see in logs while debugging.
             VERBOSE_EVENTS = {
@@ -439,30 +429,29 @@ async def _run_openai_text_soniox(twilio_ws: WebSocket, ctx: dict, stream_sid: s
                         print(f"[oai] {t}")
 
                 if t == "response.created":
-                    if soniox is not None:
-                        print("[oai] response.created while prior Soniox turn still active — cancelling")
-                        await cancel_soniox_turn()
+                    if current_stream is not None:
+                        print("[oai] response.created while prior Soniox stream still active — cancelling")
+                        await cancel_current_stream()
                     resp_id = ev.get("response", {}).get("id") or "resp"
                     print(f"[oai] response.created id={resp_id}")
-                    s = SonioxSession(resp_id)
-                    await s.__aenter__()
-                    soniox = s
-                    soniox_audio_task = asyncio.create_task(forward_soniox_audio(s))
+                    stream = await soniox_conn.start_stream(resp_id)
+                    current_stream = stream
+                    current_audio_task = asyncio.create_task(forward_stream_audio(stream))
                     delta_count = 0
                 elif t in ("response.output_text.delta", "response.text.delta"):
-                    if soniox is not None:
+                    if current_stream is not None:
                         delta = ev.get("delta", "")
                         if delta:
                             delta_count += 1
                             try:
-                                await soniox.send_text(delta)
+                                await current_stream.send_text(delta)
                             except Exception as e:
                                 print("[soniox] send_text error:", e)
                 elif t == "response.done":
-                    if soniox is not None:
+                    if current_stream is not None:
                         print(f"[oai] response.done after {delta_count} text deltas — flushing text_end")
                         try:
-                            await soniox.send_text("", end=True)
+                            await current_stream.send_text("", end=True)
                         except Exception as e:
                             print("[soniox] text_end error:", e)
                     last_assistant_item = None
@@ -475,7 +464,7 @@ async def _run_openai_text_soniox(twilio_ws: WebSocket, ctx: dict, stream_sid: s
         try:
             await asyncio.gather(twilio_to_openai(), openai_to_soniox(), return_exceptions=True)
         finally:
-            await cancel_soniox_turn()
+            await cancel_current_stream()
 
 
 if __name__ == "__main__":

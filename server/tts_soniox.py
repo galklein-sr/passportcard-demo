@@ -1,15 +1,34 @@
 """Soniox real-time TTS WebSocket client.
 
-One SonioxSession == one assistant turn. The OpenAI Realtime API streams text
-deltas; we forward them as `text` chunks, then send `text_end:true` when the
-turn is done. Soniox streams base64-encoded pcm_mulaw @ 8 kHz back, which
-slots straight into Twilio's media frames.
+The Soniox real-time API multiplexes up to 5 concurrent streams per
+WebSocket. We open ONE connection for the duration of a call and run
+each assistant turn as a separate stream, identified by `stream_id`.
+A background reader demuxes server messages into per-stream queues, and
+a heartbeat task sends `keep_alive` every 20s so the connection isn't
+dropped between turns.
 
-Protocol reference: https://soniox.com/docs/api-reference/tts/websocket-api
+Per-turn lifecycle (3-step handshake):
+  client config(stream_id)             ─▶
+  client text(chunk, end=False) ...    ─▶
+  client text(end=True)                ─▶
+                                       ◀─ audio chunks (base64 pcm_mulaw)
+                                       ◀─ audio_end: true
+                                       ◀─ terminated: true
+
+Cancellation:
+  client {"stream_id": ..., "cancel": true}  ─▶
+                                              ◀─ terminated: true
+
+References:
+- https://soniox.com/docs/tts/rt/streams
+- https://soniox.com/docs/tts/rt/termination
+- https://soniox.com/docs/tts/rt/connection-keepalive
+- https://soniox.com/docs/api-reference/tts/websocket-api
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 from typing import AsyncIterator
@@ -18,6 +37,7 @@ import websockets
 
 
 SONIOX_WS_URL = "wss://tts-rt.soniox.com/tts-websocket"
+KEEPALIVE_INTERVAL_SEC = 20  # docs say every 20-30s during idle
 
 
 def _config_message(stream_id: str) -> dict:
@@ -32,76 +52,182 @@ def _config_message(stream_id: str) -> dict:
     }
 
 
-class SonioxSession:
-    """Per-turn Soniox TTS WebSocket session.
+class SonioxStream:
+    """One assistant turn. Created via SonioxConnection.start_stream()."""
 
-    Usage:
-        async with SonioxSession(stream_id) as s:
-            await s.send_text("hello ")
-            await s.send_text("world", end=True)
-            async for mulaw_b64 in s.audio():
-                ...
-    """
+    # Sentinel pushed onto the audio queue to signal stream termination.
+    _END = object()
 
-    def __init__(self, stream_id: str):
+    def __init__(self, conn: "SonioxConnection", stream_id: str):
+        self._conn = conn
         self.stream_id = stream_id
-        self._ws: websockets.WebSocketClientProtocol | None = None
+        self._queue: asyncio.Queue = asyncio.Queue()
         self._text_end_sent = False
-
-    async def __aenter__(self) -> "SonioxSession":
-        self._ws = await websockets.connect(SONIOX_WS_URL, max_size=None)
-        await self._ws.send(json.dumps(_config_message(self.stream_id)))
-        print(f"[soniox] {self.stream_id} connected")
-        return self
-
-    async def __aexit__(self, exc_type, exc, tb) -> None:
-        if self._ws is not None:
-            try:
-                await self._ws.close()
-            except Exception:
-                pass
-            self._ws = None
-            print(f"[soniox] {self.stream_id} closed")
+        self._closed = False
 
     async def send_text(self, text: str, end: bool = False) -> None:
-        # Soniox accepts a single `text_end:true`; subsequent text after the end
-        # signal is undefined and at least sometimes truncates the streamed audio.
-        if self._text_end_sent:
+        # Soniox accepts a single `text_end:true`; further sends after end
+        # are undefined and have been seen to truncate trailing audio.
+        if self._text_end_sent or self._closed:
             return
-        assert self._ws is not None
         if end:
             self._text_end_sent = True
-        await self._ws.send(json.dumps({
+        await self._conn._send_json({
             "text": text,
             "text_end": end,
             "stream_id": self.stream_id,
-        }))
+        })
 
     async def cancel(self) -> None:
-        if self._ws is None:
+        if self._closed:
             return
+        # Mark text_end as sent so subsequent send_text calls become no-ops.
+        self._text_end_sent = True
         try:
-            await self._ws.send(json.dumps({
+            await self._conn._send_json({
                 "stream_id": self.stream_id,
                 "cancel": True,
-            }))
+            })
         except Exception:
             pass
 
     async def audio(self) -> AsyncIterator[str]:
         """Yield base64-encoded pcm_mulaw chunks until the stream terminates."""
-        assert self._ws is not None
         bytes_yielded = 0
-        async for raw in self._ws:
-            ev = json.loads(raw)
-            if "audio" in ev:
-                payload = ev["audio"]
-                # Soniox b64 chunk length / 4 * 3 ≈ raw bytes (1 byte/ms @ 8 kHz µ-law).
-                bytes_yielded += (len(payload) * 3) // 4
-                yield payload
-            if ev.get("terminated"):
-                print(f"[soniox] {self.stream_id} terminated, ~{bytes_yielded}ms audio")
-                return
-            if "error_code" in ev:
-                print(f"[soniox] {self.stream_id} error:", ev)
-                return
+        while True:
+            item = await self._queue.get()
+            if item is self._END:
+                break
+            assert isinstance(item, str)
+            bytes_yielded += (len(item) * 3) // 4  # rough decoded length
+            yield item
+        print(f"[soniox] {self.stream_id} ended (~{bytes_yielded}ms audio)")
+
+    # ---- internal: called by SonioxConnection reader ----
+
+    def _push_audio(self, b64: str) -> None:
+        self._queue.put_nowait(b64)
+
+    def _close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._queue.put_nowait(self._END)
+
+
+class SonioxConnection:
+    """One persistent Soniox WebSocket, multiplexing many SonioxStream turns.
+
+    Usage:
+        async with SonioxConnection() as conn:
+            stream = await conn.start_stream("resp_1")
+            await stream.send_text("Hello, ")
+            await stream.send_text("world.", end=True)
+            async for chunk in stream.audio():
+                ...
+            # connection stays open; start more streams as needed
+    """
+
+    def __init__(self):
+        self._ws: websockets.WebSocketClientProtocol | None = None
+        self._streams: dict[str, SonioxStream] = {}
+        self._reader_task: asyncio.Task | None = None
+        self._keepalive_task: asyncio.Task | None = None
+        self._send_lock = asyncio.Lock()
+        self._closed = False
+
+    async def __aenter__(self) -> "SonioxConnection":
+        self._ws = await websockets.connect(SONIOX_WS_URL, max_size=None)
+        self._reader_task = asyncio.create_task(self._reader_loop())
+        self._keepalive_task = asyncio.create_task(self._keepalive_loop())
+        print("[soniox] connection open")
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        await self.close()
+
+    async def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        # Drain any open streams so their audio iterators exit.
+        for s in list(self._streams.values()):
+            s._close()
+        self._streams.clear()
+        if self._keepalive_task:
+            self._keepalive_task.cancel()
+        if self._reader_task:
+            self._reader_task.cancel()
+        if self._ws is not None:
+            try:
+                await self._ws.close()
+            except Exception:
+                pass
+        print("[soniox] connection closed")
+
+    async def start_stream(self, stream_id: str) -> SonioxStream:
+        """Send config for a new stream and return its handle."""
+        if self._closed or self._ws is None:
+            raise RuntimeError("SonioxConnection is closed")
+        stream = SonioxStream(self, stream_id)
+        self._streams[stream_id] = stream
+        await self._send_json(_config_message(stream_id))
+        print(f"[soniox] stream {stream_id} started")
+        return stream
+
+    # ---- internals ----
+
+    async def _send_json(self, payload: dict) -> None:
+        if self._ws is None:
+            return
+        async with self._send_lock:
+            await self._ws.send(json.dumps(payload))
+
+    async def _reader_loop(self) -> None:
+        assert self._ws is not None
+        try:
+            async for raw in self._ws:
+                try:
+                    ev = json.loads(raw)
+                except Exception:
+                    continue
+                sid = ev.get("stream_id")
+                stream = self._streams.get(sid) if sid else None
+
+                if "error_code" in ev:
+                    print(f"[soniox] stream {sid} error: {ev}")
+                    if stream is not None:
+                        stream._close()
+                        self._streams.pop(sid, None)
+                    continue
+
+                if stream is None:
+                    # Message for an unknown/closed stream — ignore.
+                    continue
+
+                if "audio" in ev:
+                    stream._push_audio(ev["audio"])
+
+                if ev.get("terminated"):
+                    print(f"[soniox] stream {sid} terminated")
+                    stream._close()
+                    self._streams.pop(sid, None)
+        except (asyncio.CancelledError, Exception) as e:
+            if not isinstance(e, asyncio.CancelledError):
+                print(f"[soniox] reader exit: {e}")
+            # Tear down all streams so their consumers stop waiting.
+            for s in list(self._streams.values()):
+                s._close()
+            self._streams.clear()
+
+    async def _keepalive_loop(self) -> None:
+        try:
+            while True:
+                await asyncio.sleep(KEEPALIVE_INTERVAL_SEC)
+                try:
+                    await self._send_json({"keep_alive": True})
+                except Exception as e:
+                    print(f"[soniox] keepalive send failed: {e}")
+                    return
+        except asyncio.CancelledError:
+            pass
