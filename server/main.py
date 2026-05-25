@@ -325,20 +325,33 @@ async def _run_openai_text_soniox(twilio_ws: WebSocket, ctx: dict, stream_sid: s
             pass
 
     async def forward_soniox_audio(session: SonioxSession):
-        """Pump Soniox audio to Twilio. On natural end (terminated), self-clean."""
+        """Pump Soniox audio to Twilio. On natural end (terminated), self-clean.
+
+        Soniox can emit large pcm_mulaw chunks (hundreds of ms). Twilio Media
+        Streams expects ~20 ms frames (160 bytes µ-law @ 8 kHz). Larger frames
+        play unevenly or get truncated on some carriers, so we re-frame here.
+        """
+        import base64
         nonlocal soniox, soniox_audio_task
+        FRAME = 160  # bytes = 20 ms of pcm_mulaw at 8 kHz
+        frames_sent = 0
         try:
             async for payload in session.audio():
-                await twilio_ws.send_text(json.dumps({
-                    "event": "media",
-                    "streamSid": stream_sid,
-                    "media": {"payload": payload},
-                }))
+                raw = base64.b64decode(payload)
+                for off in range(0, len(raw), FRAME):
+                    chunk = raw[off:off + FRAME]
+                    await twilio_ws.send_text(json.dumps({
+                        "event": "media",
+                        "streamSid": stream_sid,
+                        "media": {"payload": base64.b64encode(chunk).decode("ascii")},
+                    }))
+                    frames_sent += 1
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            print("Soniox audio forward error:", e)
+            print("[soniox] forward error:", e)
         finally:
+            print(f"[soniox] {session.stream_id} forwarded {frames_sent} frames ({frames_sent*20}ms)")
             # If still the active session, mark idle and close.
             if soniox is session:
                 soniox = None
@@ -355,6 +368,9 @@ async def _run_openai_text_soniox(twilio_ws: WebSocket, ctx: dict, stream_sid: s
     ) as oai_ws:
         # Same session shape as the audio path, but output_modalities=["text"] —
         # OpenAI keeps doing STT + server_vad turn-taking; we render audio via Soniox.
+        # interrupt_response=False: OpenAI doesn't see the Soniox audio playing to
+        # the customer, so any echo bleeding back into the call would otherwise be
+        # treated as customer speech and barge-in over the agent's first sentence.
         await oai_ws.send(json.dumps({
             "type": "session.update",
             "session": {
@@ -366,10 +382,11 @@ async def _run_openai_text_soniox(twilio_ws: WebSocket, ctx: dict, stream_sid: s
                         "format": {"type": "audio/pcmu"},
                         "turn_detection": {
                             "type": "server_vad",
-                            "threshold": 0.5,
+                            "threshold": 0.6,
                             "prefix_padding_ms": 300,
-                            "silence_duration_ms": 500,
+                            "silence_duration_ms": 600,
                             "create_response": True,
+                            "interrupt_response": False,
                         },
                     },
                 },
@@ -396,45 +413,48 @@ async def _run_openai_text_soniox(twilio_ws: WebSocket, ctx: dict, stream_sid: s
 
         async def openai_to_soniox():
             nonlocal soniox, soniox_audio_task
+            delta_count = 0
             async for raw in oai_ws:
                 ev = json.loads(raw)
                 t = ev.get("type")
                 if t == "response.created":
                     # Start a fresh Soniox turn. If one is somehow still open, drop it.
                     if soniox is not None:
+                        print("[oai] response.created while prior Soniox turn still active — cancelling")
                         await cancel_soniox_turn()
                     resp_id = ev.get("response", {}).get("id") or "resp"
+                    print(f"[oai] response.created id={resp_id}")
                     s = SonioxSession(resp_id)
                     await s.__aenter__()
                     soniox = s
                     soniox_audio_task = asyncio.create_task(forward_soniox_audio(s))
+                    delta_count = 0
                 elif t in ("response.output_text.delta", "response.text.delta"):
                     if soniox is not None:
                         delta = ev.get("delta", "")
                         if delta:
+                            delta_count += 1
                             try:
                                 await soniox.send_text(delta)
                             except Exception as e:
-                                print("Soniox send_text error:", e)
-                elif t in ("response.output_text.done", "response.done"):
+                                print("[soniox] send_text error:", e)
+                elif t == "response.done":
+                    # End-of-response is the only signal we use to flush text_end.
+                    # `response.output_text.done` also fires but earlier double-flushing
+                    # caused Soniox to truncate the trailing audio.
                     if soniox is not None:
+                        print(f"[oai] response.done after {delta_count} text deltas — flushing text_end")
                         try:
                             await soniox.send_text("", end=True)
                         except Exception as e:
-                            print("Soniox text_end error:", e)
+                            print("[soniox] text_end error:", e)
                 elif t == "input_audio_buffer.speech_started":
-                    # Barge-in: cancel OpenAI response, cancel Soniox turn, clear Twilio buffer.
-                    try:
-                        await oai_ws.send(json.dumps({"type": "response.cancel"}))
-                    except Exception:
-                        pass
-                    await cancel_soniox_turn()
-                    await twilio_ws.send_text(json.dumps({
-                        "event": "clear",
-                        "streamSid": stream_sid,
-                    }))
+                    # interrupt_response=False on the session means OpenAI buffers the
+                    # incoming speech but won't cancel the in-flight response. Echo or
+                    # background noise will no longer cut off Soniox mid-utterance.
+                    print("[oai] speech_started (buffered, no barge-in in soniox mode)")
                 elif t == "error":
-                    print("OpenAI realtime error:", ev)
+                    print("[oai] error:", ev)
 
         try:
             await asyncio.gather(twilio_to_openai(), openai_to_soniox(), return_exceptions=True)
